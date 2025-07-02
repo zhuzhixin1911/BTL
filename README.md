@@ -9,7 +9,6 @@
 
 ## Giao diện ứng dụng
 
-![Giao diện ứng dụng]
 <img src="111.png" alt="Mô tả ảnh" style="display: block; margin: auto;">
 
 ---
