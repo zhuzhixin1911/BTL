@@ -1,0 +1,427 @@
+#@title Mô phỏng Bảo mật Tin nhắn Âm thanh
+
+# ==============================================================================
+# PHẦN 1: CÀI ĐẶT VÀ CẤU HÌNH
+# ==============================================================================
+# In ra thông báo cho người dùng biết quá trình đang bắt đầu.
+print("⏳ Bước 1: Cài đặt các thư viện cần thiết...")
+# Sử dụng pip để cài đặt các thư viện Python cần thiết một cách "âm thầm" (-q: quiet).
+# - flask: Framework để tạo máy chủ web.
+# - pyngrok: Thư viện để tạo một đường hầm (tunnel) an toàn từ máy chủ cục bộ ra Internet bằng dịch vụ ngrok.
+# - cryptography: Thư viện cốt lõi để thực hiện các thao tác mã hóa.
+!pip install flask pyngrok cryptography -q
+print("✅ Cài đặt hoàn tất.")
+
+print("🔑 Bước 2: Cấu hình token ngrok...")
+# Cấu hình token xác thực cho ngrok.
+# Lệnh này lưu token vào file cấu hình mặc định của ngrok.
+!ngrok authtoken YOUR_TOKEN_HERE
+print("✅ Token đã được cấu hình.")
+
+# ==============================================================================
+# PHẦN 2: MÃ NGUỒN ỨNG DỤNG (BACKEND + FRONTEND)
+# ==============================================================================
+# --- Nhập các thư viện và module cần thiết cho Backend ---
+import os  # Module để tương tác với hệ điều hành, dùng để tạo số ngẫu nhiên an toàn (os.urandom).
+import base64  # Module để mã hóa và giải mã dữ liệu nhị phân sang định dạng văn bản an toàn (Base64).
+import json  # Module để làm việc với dữ liệu JSON.
+import io  # Module để làm việc với các luồng dữ liệu (stream) trong bộ nhớ, dùng để tạo file zip.
+import zipfile  # Module để tạo và đọc các file nén ZIP.
+from flask import Flask, request, jsonify, render_template_string, Response  # Các thành phần từ framework Flask.
+from pyngrok import ngrok  # Module để quản lý đường hầm ngrok.
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as rsa_padding # Các thành phần cho mã hóa bất đối xứng RSA.
+from cryptography.hazmat.primitives import hashes, serialization  # Các thành phần cho hàm băm (hashing) và tuần tự hóa khóa (key serialization).
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # Các thành phần cho mã hóa đối xứng AES.
+from cryptography.hazmat.primitives.padding import PKCS7  # Module để thêm phần đệm (padding) cho dữ liệu trước khi mã hóa.
+
+# Khởi tạo ứng dụng Flask. `__name__` là một biến đặc biệt trong Python, giúp Flask biết vị trí của ứng dụng.
+app = Flask(__name__)
+
+# Tạo một "bộ nhớ đệm" (cache) đơn giản dưới dạng dictionary để lưu kết quả xử lý cuối cùng.
+# Việc này cần thiết để chức năng tải xuống có thể truy cập vào dữ liệu đã xử lý.
+last_result_cache = {}
+
+# --- Giao diện (Frontend) ---
+# Toàn bộ giao diện người dùng (HTML, CSS, JavaScript) được chứa trong một chuỗi đa dòng của Python.
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mô phỏng Bảo mật Tin nhắn Âm thanh</title>
+    <style>
+        /* Các quy tắc CSS để làm cho giao diện trông đẹp mắt và chuyên nghiệp. */
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.6; padding: 20px; background-color: #f4f7f9; color: #333; }
+        .container { max-width: 1200px; margin: auto; background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        h1, h2 { color: #0056b3; border-bottom: 2px solid #eef; padding-bottom: 10px; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; } /* Tạo layout dạng lưới 2 cột */
+        .box { padding: 20px; border: 1px solid #ddd; border-radius: 5px; background-color: #fafafa; }
+        textarea { width: 100%; height: 150px; padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px; box-sizing: border-box; }
+        button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; margin-top: 10px; transition: background-color 0.3s; }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; } /* Kiểu cho nút bị vô hiệu hóa */
+        #stop-recording-btn { background-color: #dc3545; }
+        #stop-recording-btn:hover { background-color: #c82333; }
+        #download-btn { background-color: #28a745; display: none; } /* Nút download ban đầu sẽ được ẩn đi */
+        #download-btn:hover { background-color: #218838; }
+        pre { background-color: #eef; padding: 15px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; font-size: 13px; max-height: 300px; overflow-y: auto; }
+        label { font-weight: bold; margin-bottom: 5px; display: block; }
+        .full-width { grid-column: 1 / -1; } /* Kiểu cho phần tử chiếm trọn chiều rộng của grid */
+        #recording-status { margin-top: 15px; font-weight: bold; color: #17a2b8; }
+        #audio-playback-container { margin-top: 20px; display: none; } /* Vùng chứa trình phát audio ban đầu ẩn đi */
+        audio { width: 100%; }
+        .error-log { color: #dc3545; font-weight: bold; } /* Kiểu cho thông báo lỗi */
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Mô phỏng Truyền tin Âm thanh An toàn (AES-256 & RSA-2048)</h1>
+        <div class="box full-width">
+            <h2>Bước 1: Tạo khóa</h2>
+            <p>Nhấn nút để tạo các cặp khóa RSA cho Alice (Người gửi) và Bob (Người nhận).</p>
+            <button id="generate-keys-btn">Tạo Khóa cho cả Alice và Bob</button>
+        </div>
+        <div class="grid">
+            <div class="box">
+                <h2>Phía Người gửi (Alice)</h2>
+                <label for="alice-public-key">Khóa công khai của Alice:</label>
+                <textarea id="alice-public-key" readonly></textarea>
+                <label for="alice-private-key">Khóa riêng của Alice:</label>
+                <textarea id="alice-private-key" readonly></textarea>
+                <hr>
+                <label for="bob-public-key-input">Khóa công khai của Bob (đã tự điền):</label>
+                <textarea id="bob-public-key-input"></textarea>
+                <hr>
+                <label>Ghi âm Tin nhắn thoại:</label>
+                <div>
+                    <button id="start-recording-btn" disabled>Bắt đầu Ghi âm</button>
+                    <button id="stop-recording-btn" disabled>Dừng Ghi âm</button>
+                </div>
+                <div id="recording-status">Trạng thái: Sẵn sàng. (Vui lòng tạo khóa trước)</div>
+                <div id="audio-playback-container">
+                    <label>Nghe lại bản ghi âm đã gửi:</label>
+                    <audio id="audio-playback" controls></audio>
+                </div>
+            </div>
+            <div class="box">
+                <h2>Phía Người nhận (Bob)</h2>
+                <label for="bob-public-key">Khóa công khai của Bob:</label>
+                <textarea id="bob-public-key" readonly></textarea>
+                <label for="bob-private-key">Khóa riêng của Bob:</label>
+                <textarea id="bob-private-key" readonly></textarea>
+            </div>
+        </div>
+        <div class="box full-width">
+            <h2>Kết quả Xử lý</h2>
+            <button id="download-btn">Tải xuống kết quả (.zip)</button>
+            <h3>Gói tin được gửi đi (JSON):</h3>
+            <pre id="packet-output">Gói tin sẽ xuất hiện ở đây...</pre>
+            <h3>Nhật ký xử lý (Log):</h3>
+            <pre id="log-output">Nhật ký các bước sẽ xuất hiện ở đây...</pre>
+        </div>
+    </div>
+    
+    <script>
+        // Lấy tham chiếu đến các phần tử HTML thông qua ID của chúng để có thể điều khiển chúng bằng JS.
+        const generateBtn = document.getElementById('generate-keys-btn');
+        const startRecordingBtn = document.getElementById('start-recording-btn');
+        const stopRecordingBtn = document.getElementById('stop-recording-btn');
+        const downloadBtn = document.getElementById('download-btn');
+        const statusDiv = document.getElementById('recording-status');
+        const audioPlayback = document.getElementById('audio-playback');
+        const audioPlaybackContainer = document.getElementById('audio-playback-container');
+        const alicePubKeyTA = document.getElementById('alice-public-key');
+        const alicePrivKeyTA = document.getElementById('alice-private-key');
+        const bobPubKeyTA = document.getElementById('bob-public-key');
+        const bobPrivKeyTA = document.getElementById('bob-private-key');
+        const bobPubKeyInputTA = document.getElementById('bob-public-key-input');
+        const packetOutput = document.getElementById('packet-output');
+        const logOutput = document.getElementById('log-output');
+
+        // Khai báo các biến sẽ được sử dụng cho việc ghi âm.
+        let mediaRecorder; // Đối tượng MediaRecorder để thực hiện việc ghi âm.
+        let audioChunks = []; // Mảng để lưu các đoạn dữ liệu âm thanh được ghi.
+
+        // Gán một hàm xử lý sự kiện 'click' cho nút "Tạo Khóa".
+        generateBtn.addEventListener('click', async () => {
+            logOutput.textContent = '⏳ Đang kết nối tới máy chủ để tạo khóa...'; // Cập nhật trạng thái
+            generateBtn.disabled = true; // Vô hiệu hóa nút để tránh nhấn nhiều lần
+            // Sử dụng khối try...catch để bắt lỗi nếu có sự cố xảy ra.
+            try {
+                // Gửi một yêu cầu POST đến API '/generate-all-keys' trên server.
+                const response = await fetch('/generate-all-keys', { method: 'POST' });
+                // Nếu server trả về lỗi (ví dụ: lỗi 500), ném ra một ngoại lệ để khối catch xử lý.
+                if (!response.ok) throw new Error(`Lỗi HTTP ${response.status} từ máy chủ.`);
+                // Chuyển đổi phản hồi từ server sang đối tượng JSON.
+                const data = await response.json();
+                // Điền các khóa nhận được vào các ô textarea tương ứng trên giao diện.
+                alicePubKeyTA.value = data.alice_public_key;
+                alicePrivKeyTA.value = data.alice_private_key;
+                bobPubKeyTA.value = data.bob_public_key;
+                bobPrivKeyTA.value = data.bob_private_key;
+                bobPubKeyInputTA.value = data.bob_public_key;
+                logOutput.textContent = '✅ Đã tạo khóa thành công! Sẵn sàng để ghi âm.';
+                startRecordingBtn.disabled = false; // Kích hoạt nút ghi âm.
+            } catch (error) {
+                // Nếu có lỗi (ví dụ: mất kết nối server), hiển thị thông báo lỗi chi tiết cho người dùng.
+                console.error('Lỗi khi tạo khóa:', error);
+                logOutput.innerHTML = `<span class="error-log">❌ LỖI KẾT NỐI KHI TẠO KHÓA!<br><br>Lý do: ${error.message}<br><br>👉 Vui lòng kiểm tra lại xem ô mã Colab có còn đang chạy không và bạn đang dùng đúng URL mới nhất.</span>`;
+            } finally {
+                // Khối finally luôn được thực thi dù có lỗi hay không.
+                generateBtn.disabled = false; // Kích hoạt lại nút "Tạo Khóa".
+            }
+        });
+
+        // Gán sự kiện 'click' cho nút "Bắt đầu Ghi âm".
+        startRecordingBtn.addEventListener('click', async () => {
+            try {
+                // Sử dụng API của trình duyệt để yêu cầu quyền truy cập micro.
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                // Khởi tạo đối tượng MediaRecorder với luồng âm thanh từ micro.
+                mediaRecorder = new MediaRecorder(stream);
+                // Reset lại các biến trạng thái.
+                audioChunks = [];
+                audioPlaybackContainer.style.display = 'none';
+                downloadBtn.style.display = 'none'; // Ẩn nút download.
+
+                // Sự kiện này được kích hoạt liên tục khi có một đoạn dữ liệu âm thanh mới được ghi.
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data); // Thêm đoạn dữ liệu vào mảng.
+                };
+                
+                // Sự kiện này được kích hoạt khi việc ghi âm dừng lại (khi gọi mediaRecorder.stop()).
+                mediaRecorder.onstop = async () => {
+                    logOutput.textContent = '⏳ Đã dừng ghi âm. Đang gửi dữ liệu để xử lý...';
+                    packetOutput.textContent = 'Đang xử lý...';
+                    // Ghép các đoạn âm thanh lại thành một file hoàn chỉnh (dưới dạng đối tượng Blob).
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    // Tạo một URL tạm thời cho file âm thanh để có thể phát lại ngay trên trình duyệt.
+                    const audioUrl = URL.createObjectURL(audioBlob);
+                    audioPlayback.src = audioUrl;
+                    audioPlaybackContainer.style.display = 'block'; // Hiển thị trình phát audio.
+                    // Tạo đối tượng FormData để đóng gói cả file và dữ liệu văn bản gửi lên server.
+                    const formData = new FormData();
+                    formData.append('audio_data', audioBlob, 'recording.webm'); // Thêm file âm thanh.
+                    formData.append('alice_private_key', alicePrivKeyTA.value); // Thêm các khóa.
+                    formData.append('alice_public_key', alicePubKeyTA.value);
+                    formData.append('bob_public_key', bobPubKeyInputTA.value);
+                    formData.append('bob_private_key', bobPrivKeyTA.value);
+
+                    // Gửi yêu cầu POST chứa file và các khóa đến server để xử lý.
+                    try {
+                        const response = await fetch('/process-message', { method: 'POST', body: formData });
+                        if (!response.ok) throw new Error(`Lỗi HTTP ${response.status} từ máy chủ.`);
+                        const result = await response.json(); // Nhận kết quả xử lý từ server.
+                        if (result.success) {
+                            // Tạo một bản sao của packet để hiển thị, không làm thay đổi packet gốc
+                            let displayPacket = { ...result.packet }; 
+                            // Nếu chuỗi cipher quá dài, rút gọn nó để hiển thị cho gọn.
+                            if (displayPacket.cipher && displayPacket.cipher.length > 250) {
+                                displayPacket.cipher = displayPacket.cipher.substring(0, 250) + '... [đã được rút gọn để hiển thị]';
+                            }
+                            // Hiển thị packet đã được tùy chỉnh.
+                            packetOutput.textContent = JSON.stringify(displayPacket, null, 2);
+                            // Hiển thị nút Download khi xử lý thành công.
+                            downloadBtn.style.display = 'inline-block';
+                        } else {
+                            packetOutput.textContent = 'Có lỗi xảy ra trong quá trình xử lý của server.';
+                        }
+                        logOutput.textContent = result.log; // Hiển thị nhật ký xử lý.
+                    } catch (error) {
+                         // Xử lý lỗi kết nối khi gửi tin nhắn.
+                         console.error('Lỗi khi xử lý tin nhắn:', error);
+                         logOutput.innerHTML = `<span class="error-log">❌ LỖI KẾT NỐI KHI GỬI TIN NHẮN!<br><br>Lý do: ${error.message}<br><br>👉 Vui lòng kiểm tra lại xem ô mã Colab có còn đang chạy không và bạn đang dùng đúng URL mới nhất.</span>`;
+                         packetOutput.textContent = 'Gửi tin thất bại.';
+                    }
+                };
+                // Bắt đầu quá trình ghi âm.
+                mediaRecorder.start();
+                // Cập nhật trạng thái và các nút trên giao diện.
+                statusDiv.textContent = "🔴 Đang ghi âm...";
+                startRecordingBtn.disabled = true;
+                stopRecordingBtn.disabled = false;
+            } catch (err) {
+                // Bắt lỗi nếu người dùng không cấp quyền truy cập micro.
+                statusDiv.textContent = `Lỗi: ${err.message}. Bạn đã cho phép truy cập micro chưa?`;
+            }
+        });
+
+        // Gán sự kiện 'click' cho nút "Dừng Ghi âm".
+        stopRecordingBtn.addEventListener('click', () => {
+            mediaRecorder.stop(); // Lệnh này sẽ kích hoạt sự kiện 'onstop' đã định nghĩa ở trên.
+            // Cập nhật lại trạng thái giao diện.
+            statusDiv.textContent = "Trạng thái: Sẵn sàng ghi âm.";
+            startRecordingBtn.disabled = false;
+            stopRecordingBtn.disabled = true;
+        });
+        
+        // Gán sự kiện 'click' cho nút "Tải xuống".
+        downloadBtn.addEventListener('click', () => {
+            // Chuyển hướng trình duyệt đến URL '/download-results' để kích hoạt việc tải file.
+            window.location.href = '/download-results';
+        });
+    </script>
+</body>
+</html>
+"""
+
+# --- Backend Logic (Phần xử lý phía máy chủ) ---
+
+# Hàm để tạo một cặp khóa RSA (công khai và bí mật) với kích thước 2048 bits.
+def generate_key_pair():
+    # Tạo khóa bí mật.
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    # Trích xuất khóa công khai từ khóa bí mật.
+    public_key = private_key.public_key()
+    # Chuyển đổi khóa bí mật sang định dạng PEM (một định dạng văn bản).
+    pem_private = private_key.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption()).decode('utf-8')
+    # Chuyển đổi khóa công khai sang định dạng PEM.
+    pem_public = public_key.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo).decode('utf-8')
+    return pem_private, pem_public
+
+# Hàm để chuyển đổi các chuỗi khóa PEM (văn bản) trở lại thành các đối tượng khóa.
+def deserialize_keys(pem_private_key, pem_public_key):
+    # Tải khóa bí mật từ chuỗi PEM nếu có.
+    private_key = serialization.load_pem_private_key(pem_private_key.encode('utf-8'), password=None) if pem_private_key else None
+    # Tải khóa công khai từ chuỗi PEM nếu có.
+    public_key = serialization.load_pem_public_key(pem_public_key.encode('utf-8')) if pem_public_key else None
+    return private_key, public_key
+
+# Định nghĩa route (đường dẫn) cho trang chủ ('/').
+@app.route('/')
+def index():
+    # Khi người dùng truy cập, trả về giao diện HTML.
+    return render_template_string(HTML_TEMPLATE)
+
+# Định nghĩa API endpoint để tạo khóa. Chỉ chấp nhận phương thức POST.
+@app.route('/generate-all-keys', methods=['POST'])
+def generate_all_keys_api():
+    # Tạo cặp khóa cho Alice.
+    alice_private, alice_public = generate_key_pair()
+    # Tạo cặp khóa cho Bob.
+    bob_private, bob_public = generate_key_pair()
+    # Trả về tất cả các khóa dưới dạng một đối tượng JSON.
+    return jsonify({
+        "alice_public_key": alice_public, "alice_private_key": alice_private,
+        "bob_public_key": bob_public, "bob_private_key": bob_private
+    })
+
+# Định nghĩa API endpoint chính để xử lý toàn bộ quá trình.
+@app.route('/process-message', methods=['POST'])
+def process_message_api():
+    log = [] # Tạo một danh sách để ghi lại nhật ký các bước xử lý.
+    global last_result_cache # Khai báo sử dụng biến tạm toàn cục.
+    try:
+        # Lấy file âm thanh và các khóa từ request gửi lên.
+        audio_file = request.files.get('audio_data')
+        if not audio_file: raise ValueError("Không nhận được dữ liệu âm thanh.")
+        alice_pem_private = request.form.get('alice_private_key')
+        alice_pem_public = request.form.get('alice_public_key')
+        bob_pem_public = request.form.get('bob_public_key')
+        bob_pem_private = request.form.get('bob_private_key')
+        audio_message_bytes = audio_file.read() # Đọc nội dung file âm thanh.
+        
+        # Mô phỏng phía người gửi (Alice)
+        log.append("--- Bắt đầu phía Người gửi (Alice) ---")
+        alice_private_key, _ = deserialize_keys(alice_pem_private, None)
+        _, bob_public_key = deserialize_keys(None, bob_pem_public)
+        aes_key = os.urandom(32) # 1. Tạo khóa phiên AES-256 ngẫu nhiên.
+        log.append("1. Alice: Tạo khóa phiên AES-256 ngẫu nhiên.")
+        encrypted_aes_key = bob_public_key.encrypt(aes_key, rsa_padding.OAEP(mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)) # 2. Mã hóa khóa AES bằng khóa công khai của Bob.
+        log.append("2. Alice: Mã hóa khóa AES bằng khóa công khai của Bob.")
+        iv = os.urandom(16) # Tạo vector khởi tạo ngẫu nhiên.
+        cipher_aes = Cipher(algorithms.AES(aes_key), modes.CBC(iv))
+        padder = PKCS7(algorithms.AES.block_size).padder() # Thêm đệm cho dữ liệu.
+        padded_data = padder.update(audio_message_bytes) + padder.finalize()
+        ciphertext = cipher_aes.encryptor().update(padded_data) # 3. Mã hóa tin nhắn âm thanh bằng AES.
+        log.append("3. Alice: Mã hóa tin nhắn thoại bằng AES-256 CBC.")
+        data_to_hash = iv + ciphertext
+        hasher = hashes.Hash(hashes.SHA256())
+        hasher.update(data_to_hash)
+        final_hash = hasher.finalize() # 4. Tạo hash của dữ liệu đã mã hóa.
+        log.append(f"4. Alice: Tạo hash SHA-256.")
+        signature = alice_private_key.sign(final_hash, rsa_padding.PSS(mgf=rsa_padding.MGF1(hashes.SHA256()), salt_length=rsa_padding.PSS.MAX_LENGTH), hashes.SHA256()) # 5. Ký lên hash bằng khóa riêng của Alice.
+        log.append("5. Alice: Dùng khóa riêng của mình để ký lên hash.")
+        # 6. Đóng gói tất cả vào một gói tin JSON.
+        packet = {"encrypted_aes_key": base64.b64encode(encrypted_aes_key).decode('utf-8'), "iv": base64.b64encode(iv).decode('utf-8'), "cipher": base64.b64encode(ciphertext).decode('utf-8'), "hash": final_hash.hex(), "sig": base64.b64encode(signature).decode('utf-8')}
+        log.append("6. Alice: Đóng gói và gửi đi.")
+        
+        # Mô phỏng phía người nhận (Bob)
+        log.append("\n--- Bắt đầu phía Người nhận (Bob) ---")
+        _, alice_public_key = deserialize_keys(None, alice_pem_public)
+        bob_private_key_obj, _ = deserialize_keys(bob_pem_private, None)
+        decrypted_aes_key = bob_private_key_obj.decrypt(base64.b64decode(packet['encrypted_aes_key']), rsa_padding.OAEP(mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)) # 1. Giải mã khóa AES bằng khóa riêng của Bob.
+        log.append("1. Bob: Dùng khóa riêng giải mã thành công khóa AES.")
+        log.append("2. Bob: Bắt đầu kiểm tra chữ ký và tính toàn vẹn...")
+        recalculated_hash_obj = hashes.Hash(hashes.SHA256())
+        recalculated_hash_obj.update(base64.b64decode(packet['iv']) + base64.b64decode(packet['cipher']))
+        recalculated_hash = recalculated_hash_obj.finalize() # Tính lại hash từ dữ liệu nhận được.
+        if recalculated_hash.hex() != packet['hash']: raise ValueError("Lỗi Toàn vẹn (Integrity Error)! Hash không khớp.") # So sánh hash.
+        log.append("   - Kiểm tra Hash Toàn vẹn: OK.")
+        alice_public_key.verify(base64.b64decode(packet['sig']), recalculated_hash, rsa_padding.PSS(mgf=rsa_padding.MGF1(hashes.SHA256()), salt_length=rsa_padding.PSS.MAX_LENGTH), hashes.SHA256()) # Xác thực chữ ký bằng khóa công khai của Alice.
+        log.append("   - Xác thực Chữ ký của Alice: OK.")
+        log.append("3. Bob: Mọi thứ hợp lệ. Tiến hành giải mã tin nhắn thoại...")
+        decryptor_cipher = Cipher(algorithms.AES(decrypted_aes_key), modes.CBC(base64.b64decode(packet['iv'])))
+        unpadder = PKCS7(algorithms.AES.block_size).unpadder() # Loại bỏ phần đệm.
+        decrypted_padded_msg = decryptor_cipher.decryptor().update(base64.b64decode(packet['cipher']))
+        decrypted_msg_bytes = unpadder.update(decrypted_padded_msg) + unpadder.finalize() # Giải mã tin nhắn.
+        log.append(f"   - Giải mã thành công! Nhận được {len(decrypted_msg_bytes)} bytes dữ liệu âm thanh.")
+        
+        # Hiển thị một phần nội dung audio đã giải mã dưới dạng Base64.
+        audio_content_preview = base64.b64encode(decrypted_msg_bytes).decode('utf-8')
+        log.append(f"   - Nội dung (Base64 rút gọn): {audio_content_preview[:75]}...")
+
+        log.append(f"\n✅ TIN NHẮN THOẠI ĐÃ ĐƯỢC GIẢI MÃ AN TOÀN! (Gửi ACK)")
+        
+        # Lưu kết quả vào biến tạm để có thể tải xuống.
+        last_result_cache['packet'] = packet
+        last_result_cache['audio_bytes'] = decrypted_msg_bytes
+        
+        # Trả về kết quả thành công.
+        return jsonify({"success": True, "packet": packet, "log": "\n".join(log)})
+    except Exception as e:
+        # Nếu có lỗi xảy ra trong quá trình xử lý.
+        log.append(f"\n❌ NACK: ĐÃ XẢY RA LỖI: {str(e)}")
+        last_result_cache.clear() # Xóa cache nếu có lỗi.
+        return jsonify({"success": False, "log": "\n".join(log)})
+
+# Định nghĩa API endpoint để tải file zip.
+@app.route('/download-results')
+def download_results():
+    # Nếu chưa có kết quả nào được lưu, báo lỗi.
+    if not last_result_cache:
+        return "Không có kết quả để tải xuống. Vui lòng xử lý một tin nhắn thành công trước.", 404
+
+    # Tạo một file ảo trong bộ nhớ RAM.
+    memory_file = io.BytesIO()
+    # Mở file zip và ghi vào file ảo trong bộ nhớ.
+    with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # Ghi file packet.json vào zip.
+        packet_json = json.dumps(last_result_cache.get('packet', {}), indent=2)
+        zf.writestr('packet.json', packet_json)
+        
+        # Ghi file audio đã giải mã vào zip.
+        audio_bytes = last_result_cache.get('audio_bytes', b'')
+        zf.writestr('decrypted_audio.webm', audio_bytes)
+    
+    memory_file.seek(0) # Đưa con trỏ về đầu file ảo.
+    
+    # Trả về một đối tượng Response, báo cho trình duyệt biết đây là một file cần tải về.
+    return Response(
+        memory_file,
+        mimetype='application/zip',
+        headers={'Content-Disposition': 'attachment;filename=secure_message_files.zip'}
+    )
+
+# ==============================================================================
+# PHẦN 3: KHỞI CHẠY ỨNG DỤNG
+# ==============================================================================
+print("🚀 Bước 3: Khởi chạy ứng dụng web...")
+# Khởi chạy một đường hầm ngrok tới cổng 5000 của máy cục bộ.
+public_url = ngrok.connect(5000)
+# In ra URL công khai để người dùng truy cập.
+print(f"🌍 Ứng dụng của bạn đang chạy tại URL công khai: {public_url}")
+
+# Khởi chạy máy chủ web Flask, lắng nghe các kết nối trên cổng 5000.
+app.run(port=5000)
