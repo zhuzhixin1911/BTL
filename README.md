@@ -9,8 +9,8 @@
 
 ## Giao diện ứng dụng
 
-![Giao diện ứng dụng]<img src="111.png" alt="Mô tả ảnh" style="display: block; margin: auto;">
-*(Lưu ý: Bạn hãy tải file ảnh `image_ea3f3b.png` lên repository và thay thế link trên bằng tên file, ví dụ: `screenshot.png`)*
+![Giao diện ứng dụng]
+<img src="111.png" alt="Mô tả ảnh" style="display: block; margin: auto;">
 
 ---
 
@@ -96,6 +96,4 @@ Dự án này được thiết kế để chạy trong một ô mã duy nhất t
 
 ---
 
-## 📄 Giấy phép
-
-Dự án này được cấp phép dưới Giấy phép MIT. Xem file `LICENSE` để biết thêm chi tiết.
+## PHAN VĂN ĐẰNG - CNTT17-07 - TRƯỜNG ĐẠI HỌC ĐẠI NAM
