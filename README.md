@@ -9,7 +9,7 @@
 
 ## Giao diện ứng dụng
 
-![Giao diện ứng dụng](https://i.imgur.com/L18Gf1H.png)
+![Giao diện ứng dụng]<img src="111.png" alt="Mô tả ảnh" style="display: block; margin: auto;">
 *(Lưu ý: Bạn hãy tải file ảnh `image_ea3f3b.png` lên repository và thay thế link trên bằng tên file, ví dụ: `screenshot.png`)*
 
 ---
